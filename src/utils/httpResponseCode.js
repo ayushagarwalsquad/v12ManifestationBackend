@@ -1,0 +1,11 @@
+module.exports = {
+    SUCCESS: 200,
+    CREATED: 201,
+    UPDATED: 202,
+    DATAMISSING: 400,
+    UNAUTHORIZED: 401,
+    FORBIDDEN: 403,
+    RESULTNOTFOUND: 404,
+    CONFLICT: 409,
+    ERROR: 500,
+}
