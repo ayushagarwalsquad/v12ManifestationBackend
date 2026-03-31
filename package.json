@@ -13,6 +13,8 @@
     "dev:unix": "NODE_OPTIONS=--dns-result-order=ipv4first node index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1020.0",
+    "@aws-sdk/s3-request-presigner": "^3.1020.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
