@@ -5,6 +5,7 @@ const userCtrl = require("../controllers/userController");
 const { userAuth } = require("../middleware/userAuth");
 
 router.post('/sendOtp', userCtrl.sendOtp);
+router.post('/verifyOtpAndRegister', userCtrl.verifyOtpAndRegister);
 router.post('/login', userCtrl.login);
 router.post('/forgetPassword', userCtrl.forgetPassword);
 router.post('/verifyPasswordResetOTP', userCtrl.verifyPasswordResetOTP);

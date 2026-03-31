@@ -1,4 +1,6 @@
 const user = require("../models/userModel");
+const Otp = require("../models/otpModel");
+const Wallet = require("../models/walletModel");
 const { responseHandler } = require("../utils/responseHandler");
 const statusCode = require("../utils/httpResponseCode");
 const { catchAsyncError } = require("../utils/generateError.js");
@@ -6,72 +8,161 @@ const { bcryptedPasswordFunc, verifyPassword } = require("../utils/bcryption");
 const { generateUserToken } = require("../utils/tokenUtils");
 
 exports.sendOtp = catchAsyncError(async (req, res) => {
-  const { countryCode, mobileNumber, username, fullname, email, password, dob, gender } = req.body;
-  if (!countryCode || !mobileNumber || !username || !fullname || !email || !password || !dob || !gender) {
+  const { countryCode, mobileNumber } = req.body;
+  if (!countryCode || !mobileNumber) {
     return responseHandler({
       res,
       code: statusCode.DATAMISSING,
-      message: "All fields are required: countryCode, mobileNumber, username, fullname, email, password, dob, gender",
+      message: "countryCode and mobileNumber are required",
     });
   }
+  const existingUser = await user.findOne({
+    countryCode,
+    mobileNumber
+  });
+  //blocked
+  if (existingUser && existingUser.status === "blocked") {
+    return responseHandler({
+      res,
+      code: statusCode.FORBIDDEN,
+      message: "Your account has been blocked"
+    });
+  }
+  //active
+  if (existingUser && existingUser.status === "active") {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "User already registered. Please login"
+    });
+  }
+  // DELETED or NEW USER → allow OTP
+  //Generate OTP (4 digits)
+  const otp = Math.floor(1000 + Math.random() * 9000).toString();
+  const expiry = new Date(Date.now() + 5 * 60 * 1000);
+  // purge old OTPs for same number
+  await Otp.deleteMany({ countryCode, mobileNumber });
+  //store new OTP
+  await Otp.create({
+    countryCode,
+    mobileNumber,
+    otp,
+    expiresAt: expiry
+  });
 
-  // Check if username, email, or mobile number already exists (excluding deleted users)
+  return responseHandler({
+    res,
+    code: statusCode.SUCCESS,
+    message: "OTP sent successfully",
+    data: { countryCode, mobileNumber, otp, expiresAt: expiry } // prod me otp mat bhejna
+  });
+});
+exports.verifyOtpAndRegister = catchAsyncError(async (req, res) => {
+  const { countryCode, mobileNumber, otp, username, fullname, email, password, dob, gender } = req.body;
+  if (!countryCode || !mobileNumber || !otp || !username || !fullname || !email || !password || !dob || !gender) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "Required fields missing"
+    });
+  }
+  const otpDoc = await Otp.findOne({ countryCode, mobileNumber });
+  if (!otpDoc) {
+    return responseHandler({
+      res,
+      code: statusCode.RESULTNOTFOUND,
+      message: "OTP expired or not found"
+    });
+  }
+  if (otpDoc.otp !== otp) {
+    return responseHandler({
+      res,
+      code: statusCode.UNAUTHORIZED,
+      message: "Invalid OTP"
+    });
+  }
+  // delete OTP after success
+  await Otp.deleteOne({ _id: otpDoc._id });
+
   const existingUser = await user.findOne({
     $or: [
       { username },
       { email },
-      { $and: [{ countryCode }, { mobileNumber }] }
+      { countryCode, mobileNumber }
     ],
     status: { $ne: "deleted" }
   });
+
   if (existingUser) {
+    if (existingUser.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+
     let conflictField = "";
     if (existingUser.username === username) {
       conflictField = "Username";
     } else if (existingUser.email === email) {
       conflictField = "Email";
-    } else if (existingUser.countryCode === countryCode && existingUser.mobileNumber === mobileNumber) {
+    } else {
       conflictField = "Mobile number";
     }
+
     return responseHandler({
       res,
       code: statusCode.CONFLICT,
-      message: `${conflictField} already exists`,
+      message: `${conflictField} already exists`
     });
   }
 
-  // Generate OTP (4 digits)
-  const otp = Math.floor(1000 + Math.random() * 9000).toString();
+  const deletedUser = await user.findOne({
+    countryCode,
+    mobileNumber,
+    status: "deleted"
+  });
 
-  // 🚫 Case 2: User exists and status = "Blocked"
-  let blockedUser = await user.findOne({ countryCode, mobileNumber, status: "blocked" });
-  if (blockedUser) {
-    return responseHandler({
-      res,
-      code: statusCode.FORBIDDEN,
-      message: "Your account has been blocked. Please contact admin.",
-    });
-  }
-  // 2️⃣ If no Active, check Deleted user → create new
-  let deletedUser = await user.findOne({ countryCode, mobileNumber, status: "deleted" });
+  const lastUser = await user.aggregate([
+    { $match: { shortId: { $regex: /^U-\d+$/ } } },
+    {
+      $addFields: {
+        numericShortId: {
+          $toInt: { $substr: ["$shortId", 2, -1] }
+        }
+      }
+    },
+    { $sort: { numericShortId: -1 } },
+    { $limit: 1 }
+  ]);
+
+  const newShortId = lastUser.length > 0 ? `U-${lastUser[0].numericShortId + 1}` : "U-1";
+
+  const hashedPassword = await bcryptedPasswordFunc(password);
+
+  let userData;
+
+  // RE-REGISTER (deleted)
   if (deletedUser) {
-    // Generate new shortId
-    const lastUser = await user.aggregate([
-      { $match: { shortId: { $regex: /^U-\d+$/ } } },
-      {
-        $addFields: {
-          numericShortId: { $toInt: { $substr: ["$shortId", 2, -1] } },
-        },
-      },
-      { $sort: { numericShortId: -1 } },
-      { $limit: 1 },
-    ]);
-    const newShortId =
-      lastUser.length > 0 ? `U-${lastUser[0].numericShortId + 1}` : "U-1";
+    deletedUser.username = username;
+    deletedUser.fullname = fullname;
+    deletedUser.email = email;
+    deletedUser.password = hashedPassword;
+    deletedUser.dob = dob;
+    deletedUser.gender = gender;
+    deletedUser.shortId = newShortId;
+    deletedUser.status = "active";
 
-    const hashedPassword = await bcryptedPasswordFunc(password);
+    deletedUser.addresses = [];
+    deletedUser.devices = [];
 
-    const newUser = new user({
+    userData = deletedUser;
+
+  } else {
+    // NEW USER
+    userData = await user.create({
+      shortId: newShortId,
       countryCode,
       mobileNumber,
       username,
@@ -80,54 +171,41 @@ exports.sendOtp = catchAsyncError(async (req, res) => {
       password: hashedPassword,
       dob,
       gender,
-      shortId: newShortId,
       status: "active",
-    });
-    await newUser.save();
-
-    return responseHandler({
-      res,
-      code: statusCode.SUCCESS,
-      message: "OTP sent successfully.",
-      data: { countryCode, mobileNumber, otp },
+      walletBalance: 0,
+      isWelcomeBonusGiven: false 
     });
   }
 
-  // 3️⃣ If no user exists at all → create new
-  const lastUser = await user.aggregate([
-    { $match: { shortId: { $regex: /^U-\d+$/ } } },
-    {
-      $addFields: {
-        numericShortId: { $toInt: { $substr: ["$shortId", 2, -1] } },
-      },
-    },
-    { $sort: { numericShortId: -1 } },
-    { $limit: 1 },
-  ]);
-  const newShortId =
-    lastUser.length > 0 ? `U-${lastUser[0].numericShortId + 1}` : "U-1";
+  // WELCOME BONUS
+  if (!userData.isWelcomeBonusGiven) {
 
-  const hashedPassword = await bcryptedPasswordFunc(password);
+    // extra safety (double protection)
+    const existingBonus = await Wallet.findOne({
+      userId: userData._id,
+      reason: "welcome_bonus"
+    });
 
-  const newUser = new user({
-    countryCode,
-    mobileNumber,
-    username,
-    fullname,
-    email,
-    password: hashedPassword,
-    dob,
-    gender,
-    shortId: newShortId,
-    status: "active",
-  });
-  await newUser.save();
+    if (!existingBonus) {
+      userData.walletBalance = (userData.walletBalance || 0) + 50;
+      userData.isWelcomeBonusGiven = true;
+
+      await Wallet.create({
+        userId: userData._id,
+        amount: 50,
+        type: "credit",
+        reason: "welcome_bonus",
+        balanceAfter: userData.walletBalance
+      });
+    }
+  }
+
+  await userData.save();
 
   return responseHandler({
     res,
     code: statusCode.SUCCESS,
-    message: "OTP sent successfully.",
-    data: { countryCode, mobileNumber, otp },
+    message: "Account created successfully"
   });
 });
 exports.login = catchAsyncError(async (req, res) => {

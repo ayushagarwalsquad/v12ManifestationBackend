@@ -58,6 +58,8 @@ const UserSchema = new Schema({
         type: String,
         enum: ["male", "female", "other"],
     },
+    walletBalance: { type: Number, default: 0 },
+    isWelcomeBonusGiven: { type: Boolean, default: false },
     resetPasswordOTP: String,
     resetPasswordExpires: Date,
     addresses: [AddressSchema],
