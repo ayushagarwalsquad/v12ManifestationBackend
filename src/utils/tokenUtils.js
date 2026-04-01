@@ -19,10 +19,3 @@ exports.generateUserToken = (user) => {
     };
     return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 };
-
-// exports.generateDriverToken = (driver) => {
-//     const payload = {
-//         driverId: driver._id,
-//     }
-//     return jwt.sign(payload, process.env.JWT_SECRET);
-// }
