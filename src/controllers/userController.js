@@ -1,129 +1,38 @@
 const user = require("../models/userModel");
-const Otp = require("../models/otpModel");
+const Manager = require("../models/managerModel");
 const Wallet = require("../models/walletModel");
+const PartnerDetails = require("../models/partnerDetailsModel");
+const InfluencerDetails = require("../models/influencerDetailsModel");
+const VerificationOtp = require("../models/verificationOtpModel");
 const { responseHandler } = require("../utils/responseHandler");
 const statusCode = require("../utils/httpResponseCode");
 const { catchAsyncError } = require("../utils/generateError.js");
 const { bcryptedPasswordFunc, verifyPassword } = require("../utils/bcryption");
 const { generateUserToken } = require("../utils/tokenUtils");
 
-exports.sendOtp = catchAsyncError(async (req, res) => {
-  const { countryCode, mobileNumber } = req.body;
-  if (!countryCode || !mobileNumber) {
-    return responseHandler({
-      res,
-      code: statusCode.DATAMISSING,
-      message: "countryCode and mobileNumber are required",
-    });
-  }
-  const existingUser = await user.findOne({
-    countryCode,
-    mobileNumber
-  });
-  //blocked
-  if (existingUser && existingUser.status === "blocked") {
-    return responseHandler({
-      res,
-      code: statusCode.FORBIDDEN,
-      message: "Your account has been blocked"
-    });
-  }
-  //active
-  if (existingUser && existingUser.status === "active") {
-    return responseHandler({
-      res,
-      code: statusCode.CONFLICT,
-      message: "User already registered. Please login"
-    });
-  }
-  // DELETED or NEW USER → allow OTP
-  //Generate OTP (4 digits)
-  const otp = Math.floor(1000 + Math.random() * 9000).toString();
-  const expiry = new Date(Date.now() + 5 * 60 * 1000);
-  // purge old OTPs for same number
-  await Otp.deleteMany({ countryCode, mobileNumber });
-  //store new OTP
-  await Otp.create({
-    countryCode,
-    mobileNumber,
-    otp,
-    expiresAt: expiry
-  });
+const normalizeTrim = (value) => (value === undefined || value === null ? "" : value.toString().trim());
+const normalizeEmail = (value) => normalizeTrim(value).toLowerCase();
+const resolveApprovedPartnerManagerByCode = async (managerCode) => {
+  const code = normalizeTrim(managerCode);
+  if (!code) return null;
 
-  return responseHandler({
-    res,
-    code: statusCode.SUCCESS,
-    message: "OTP sent successfully",
-    data: { countryCode, mobileNumber, otp, expiresAt: expiry } // prod me otp mat bhejna
-  });
-});
-exports.verifyOtpAndRegister = catchAsyncError(async (req, res) => {
-  const { countryCode, mobileNumber, otp, username, fullname, email, password, dob, gender } = req.body;
-  if (!countryCode || !mobileNumber || !otp || !username || !fullname || !email || !password || !dob || !gender) {
-    return responseHandler({
-      res,
-      code: statusCode.DATAMISSING,
-      message: "Required fields missing"
-    });
-  }
-  const otpDoc = await Otp.findOne({ countryCode, mobileNumber });
-  if (!otpDoc) {
-    return responseHandler({
-      res,
-      code: statusCode.RESULTNOTFOUND,
-      message: "OTP expired or not found"
-    });
-  }
-  if (otpDoc.otp !== otp) {
-    return responseHandler({
-      res,
-      code: statusCode.UNAUTHORIZED,
-      message: "Invalid OTP"
-    });
-  }
-  // delete OTP after success
-  await Otp.deleteOne({ _id: otpDoc._id });
+  return Manager.findOne({
+    partnerCode: code,
+    managerType: "partner_manager",
+    status: "active"
+  }).select("_id partnerCode").lean();
+};
+const resolveApprovedAgencyManagerByCode = async (agencyCode) => {
+  const code = normalizeTrim(agencyCode);
+  if (!code) return null;
 
-  const existingUser = await user.findOne({
-    $or: [
-      { username },
-      { email },
-      { countryCode, mobileNumber }
-    ],
-    status: { $ne: "deleted" }
-  });
-
-  if (existingUser) {
-    if (existingUser.status === "blocked") {
-      return responseHandler({
-        res,
-        code: statusCode.FORBIDDEN,
-        message: "Your account has been blocked"
-      });
-    }
-
-    let conflictField = "";
-    if (existingUser.username === username) {
-      conflictField = "Username";
-    } else if (existingUser.email === email) {
-      conflictField = "Email";
-    } else {
-      conflictField = "Mobile number";
-    }
-
-    return responseHandler({
-      res,
-      code: statusCode.CONFLICT,
-      message: `${conflictField} already exists`
-    });
-  }
-
-  const deletedUser = await user.findOne({
-    countryCode,
-    mobileNumber,
-    status: "deleted"
-  });
-
+  return Manager.findOne({
+    partnerCode: code,
+    managerType: "agency_manager",
+    status: "active"
+  }).select("_id partnerCode").lean();
+};
+const getNextShortId = async () => {
   const lastUser = await user.aggregate([
     { $match: { shortId: { $regex: /^U-\d+$/ } } },
     {
@@ -137,70 +46,228 @@ exports.verifyOtpAndRegister = catchAsyncError(async (req, res) => {
     { $limit: 1 }
   ]);
 
-  const newShortId = lastUser.length > 0 ? `U-${lastUser[0].numericShortId + 1}` : "U-1";
+  return lastUser.length > 0 ? `U-${lastUser[0].numericShortId + 1}` : "U-1";
+};
+const getNextGeneralCode = async () => {
+  const lastUser = await user.aggregate([
+    { $match: { generalCode: { $regex: /^gen-\d+$/ } } },
+    {
+      $addFields: {
+        numericGeneralCode: {
+          $toInt: { $substr: ["$generalCode", 4, -1] }
+        }
+      }
+    },
+    { $sort: { numericGeneralCode: -1 } },
+    { $limit: 1 }
+  ]);
 
-  const hashedPassword = await bcryptedPasswordFunc(password);
-
-  let userData;
-
-  // RE-REGISTER (deleted)
-  if (deletedUser) {
-    deletedUser.username = username;
-    deletedUser.fullname = fullname;
-    deletedUser.email = email;
-    deletedUser.password = hashedPassword;
-    deletedUser.dob = dob;
-    deletedUser.gender = gender;
-    deletedUser.shortId = newShortId;
-    deletedUser.status = "active";
-
-    deletedUser.addresses = [];
-    deletedUser.devices = [];
-
-    userData = deletedUser;
-
-  } else {
-    // NEW USER
-    userData = await user.create({
-      shortId: newShortId,
-      countryCode,
-      mobileNumber,
-      username,
-      fullname,
-      email,
-      password: hashedPassword,
-      dob,
-      gender,
-      status: "active",
-      walletBalance: 0,
-      isWelcomeBonusGiven: false 
-    });
-  }
-
+  const nextNumber = lastUser.length > 0 ? lastUser[0].numericGeneralCode + 1 : 1;
+  return `gen-${String(nextNumber).padStart(3, "0")}`;
+};
+const applyWelcomeBonusAndCodes = async (userDoc) => {
   // WELCOME BONUS
-  if (!userData.isWelcomeBonusGiven) {
-
+  if (!userDoc.isWelcomeBonusGiven) {
     // extra safety (double protection)
     const existingBonus = await Wallet.findOne({
-      userId: userData._id,
+      userId: userDoc._id,
       reason: "welcome_bonus"
     });
 
     if (!existingBonus) {
-      userData.walletBalance = (userData.walletBalance || 0) + 50;
-      userData.isWelcomeBonusGiven = true;
+      userDoc.walletBalance = (userDoc.walletBalance || 0) + 50;
+      userDoc.isWelcomeBonusGiven = true;
 
       await Wallet.create({
-        userId: userData._id,
+        userId: userDoc._id,
         amount: 50,
         type: "credit",
         reason: "welcome_bonus",
-        balanceAfter: userData.walletBalance
+        balanceAfter: userDoc.walletBalance
       });
     }
   }
 
-  await userData.save();
+  if (!userDoc.generalCode) {
+    userDoc.generalCode = await getNextGeneralCode();
+  }
+  if (!userDoc.activeCode) {
+    userDoc.activeCode = userDoc.generalCode;
+    userDoc.activeCodeType = "general";
+  }
+
+  await userDoc.save();
+};
+
+exports.sendOtp = catchAsyncError(async (req, res) => {
+  const { email, countryCode, mobileNumber } = req.body;
+  if (!email || !countryCode || !mobileNumber) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "email, countryCode and mobileNumber are required",
+    });
+  }
+
+  const normalizedEmail = email.toString().trim().toLowerCase();
+  const normalizedCountryCode = countryCode.toString().trim();
+  const normalizedMobileNumber = mobileNumber.toString().trim();
+
+  //find any user with same email or mobile
+  const existingUser = await user.findOne({
+    $or: [
+      { email: normalizedEmail },
+      { countryCode: normalizedCountryCode, mobileNumber: normalizedMobileNumber }
+    ]
+  });
+
+  if (existingUser) {
+    //BLOCKED CASE (highest priority)
+    if (existingUser.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+
+    //ACTIVE USER (already exists)
+    if (existingUser.status !== "deleted") {
+      let conflictField = "";
+
+      if ((existingUser.email || "").toLowerCase() === normalizedEmail) {
+        conflictField = "Email";
+      } else {
+        conflictField = "Mobile number";
+      }
+
+      return responseHandler({
+        res,
+        code: statusCode.CONFLICT,
+        message: `${conflictField} already exists`
+      });
+    }
+    //if deleted hai → allow OTP (re-register case)
+  }
+
+  //Generate OTP (4 digits)
+  const generateOtp = () => Math.floor(1000 + Math.random() * 9000).toString();
+  const emailOtp = generateOtp();
+  const mobileOtp = generateOtp();
+
+  return responseHandler({
+    res,
+    code: statusCode.SUCCESS,
+    message: "OTP generated successfully",
+    data: {
+      email: normalizedEmail,
+      mobileNumber: normalizedCountryCode + normalizedMobileNumber,
+      emailOtp,
+      mobileOtp,
+    },
+  });
+});
+exports.createAccount = catchAsyncError(async (req, res) => {
+  const {
+    countryCode,
+    mobileNumber,
+    username,
+    fullname,
+    email,
+    password,
+    dob,
+    gender,
+    profileImage
+  } = req.body;
+  if (!countryCode || !mobileNumber || !username || !fullname || !email || !password || !dob || !gender) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "Required fields missing"
+    });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedCountryCode = normalizeTrim(countryCode);
+  const normalizedMobileNumber = normalizeTrim(mobileNumber);
+
+  const existingUserQuery = {
+    $or: [
+      { username },
+      { email: normalizedEmail },
+      { countryCode: normalizedCountryCode, mobileNumber: normalizedMobileNumber }
+    ],
+    status: { $ne: "deleted" }
+  };
+
+  const existingUser = await user.findOne(existingUserQuery);
+
+  if (existingUser) {
+    if (existingUser.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+
+    let conflictField = "";
+    if (existingUser.username === username) {
+      conflictField = "Username";
+    } else if ((existingUser.email || "").toLowerCase() === normalizedEmail) {
+      conflictField = "Email";
+    } else {
+      conflictField = "Mobile number";
+    }
+
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: `${conflictField} already exists`
+    });
+  }
+
+  // Username check (ignore deleted users)
+  const usernameTaken = await user.findOne({
+    username,
+    status: { $ne: "deleted" }
+  });
+  if (usernameTaken) {
+    if (usernameTaken.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "Username already exists"
+    });
+  }
+  // Create new user always
+  const newShortId = await getNextShortId();
+  const hashedPassword = await bcryptedPasswordFunc(password);
+
+  // NEW USER
+  const userData = await user.create({
+    shortId: newShortId,
+    countryCode: normalizedCountryCode,
+    mobileNumber: normalizedMobileNumber,
+    username,
+    fullname,
+    email: normalizedEmail,
+    password: hashedPassword,
+    dob,
+    gender,
+    profileImage,
+    roles: ["user"],
+    status: "active",
+    walletBalance: 0,
+    isWelcomeBonusGiven: false
+  });
+  await applyWelcomeBonusAndCodes(userData);
 
   return responseHandler({
     res,
@@ -223,7 +290,6 @@ exports.login = catchAsyncError(async (req, res) => {
     $or: [{ username: usernameOrEmail }, { email: usernameOrEmail }],
     status: "active"
   });
-  console.log("Found user for login:", foundUser);
 
   if (!foundUser) {
     return responseHandler({
@@ -231,11 +297,6 @@ exports.login = catchAsyncError(async (req, res) => {
       code: statusCode.UNAUTHORIZED,
       message: "Invalid credentials",
     });
-  }
-
-  // On first login after agreeToTerms:true is sent, store acceptance in DB.
-  if (agreedToTerms && foundUser.agreeToTerms !== true) {
-    foundUser.agreeToTerms = true;
   }
 
   const isPasswordValid = await verifyPassword(password, foundUser.password);
@@ -246,6 +307,39 @@ exports.login = catchAsyncError(async (req, res) => {
       message: "Invalid credentials",
     });
   }
+
+
+  let loginAs = "user";
+  let resolvedInfluencerId = null;
+  const influencerProfile = await InfluencerDetails.findOne({ userId: foundUser._id });
+
+  if (influencerProfile) {
+    resolvedInfluencerId = influencerProfile._id;
+
+    if (influencerProfile.verificationStatus === "approved" && influencerProfile.isVerified) {
+      loginAs = "influencer";
+
+      foundUser.activeCode = influencerProfile.influencerCode;
+      foundUser.activeCodeType = "influencer";
+
+    } else if (influencerProfile.verificationStatus === "pending") {
+      loginAs = "pending_influencer";
+
+    } else if (influencerProfile.verificationStatus === "rejected") {
+      loginAs = "rejected_influencer";
+    }
+  } else {
+    if (foundUser.generalCode) {
+      foundUser.activeCode = foundUser.generalCode;
+      foundUser.activeCodeType = "general";
+    }
+  }
+
+  if (agreedToTerms && foundUser.agreeToTerms !== true) {
+    foundUser.agreeToTerms = true;
+  }
+
+
 
   const token = generateUserToken(foundUser);
 
@@ -269,9 +363,694 @@ exports.login = catchAsyncError(async (req, res) => {
     res,
     code: statusCode.SUCCESS,
     message: "Login successful",
-    data: { token },
+    data: {
+      token,
+      loginAs,
+      roles: foundUser.roles,
+      influencerId: resolvedInfluencerId,
+      activeCode: foundUser.activeCode,
+      activeCodeType: foundUser.activeCodeType,
+    },
   });
 });
+exports.partnerLogin = catchAsyncError(async (req, res) => {
+  const { usernameOrEmail, password, deviceType, deviceToken, agreeToTerms } = req.body;
+  const agreedToTerms = agreeToTerms === true || agreeToTerms === "true";
+
+  if (!usernameOrEmail || !password || !deviceType || !deviceToken || !agreedToTerms) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "Username/Email, password, deviceType, deviceToken and agreeToTerms(true) are required",
+    });
+  }
+
+  const foundUser = await user.findOne({
+    $or: [{ username: usernameOrEmail }, { email: usernameOrEmail }],
+    status: "active"
+  });
+
+  if (!foundUser) {
+    return responseHandler({
+      res,
+      code: statusCode.UNAUTHORIZED,
+      message: "Invalid credentials",
+    });
+  }
+
+  const isPasswordValid = await verifyPassword(password, foundUser.password);
+  if (!isPasswordValid) {
+    return responseHandler({
+      res,
+      code: statusCode.UNAUTHORIZED,
+      message: "Invalid credentials",
+    });
+  }
+
+  const partnerProfile = await PartnerDetails.findOne({ userId: foundUser._id }).sort({ createdAt: -1 });
+  if (!partnerProfile) {
+    return responseHandler({
+      res,
+      code: statusCode.FORBIDDEN,
+      message: "This account is not registered as partner",
+    });
+  }
+
+  if (partnerProfile.verificationStatus !== "approved" || partnerProfile.isVerified !== true) {
+    const status = partnerProfile.verificationStatus || "pending";
+    const message =
+      status === "rejected"
+        ? `Partner request rejected${partnerProfile.rejectionReason ? `: ${partnerProfile.rejectionReason}` : ""}`
+        : "Partner request is not approved yet";
+
+    return responseHandler({
+      res,
+      code: statusCode.FORBIDDEN,
+      message,
+      data: { verificationStatus: status },
+    });
+  }
+
+  if (!partnerProfile.partnerCode) {
+    return responseHandler({
+      res,
+      code: statusCode.ERROR,
+      message: "Partner code is not generated yet. Please contact support.",
+    });
+  }
+
+  foundUser.activeCode = partnerProfile.partnerCode;
+  foundUser.activeCodeType = "partner";
+
+  if (agreedToTerms && foundUser.agreeToTerms !== true) {
+    foundUser.agreeToTerms = true;
+  }
+
+  const token = generateUserToken(foundUser);
+
+  const existingDevice = foundUser.devices.find((d) => d.deviceToken === deviceToken);
+  if (existingDevice) {
+    existingDevice.deviceType = deviceType;
+    existingDevice.accessToken = token;
+    existingDevice.updatedAt = new Date();
+  } else {
+    foundUser.devices.push({
+      deviceType,
+      deviceToken,
+      accessToken: token
+    });
+  }
+
+  await foundUser.save();
+
+  return responseHandler({
+    res,
+    code: statusCode.SUCCESS,
+    message: "Partner login successful",
+    data: {
+      token,
+      loginAs: "partner",
+      roles: foundUser.roles,
+      partnerId: partnerProfile._id,
+      activeCode: foundUser.activeCode,
+      activeCodeType: foundUser.activeCodeType,
+    },
+  });
+});
+exports.registerInfluencer = catchAsyncError(async (req, res) => {
+  const {
+    countryCode,
+    mobileNumber,
+    username,
+    fullname,
+    email,
+    password,
+    dob,
+    gender,
+    profileImage,
+    instaId,
+    facebookId
+  } = req.body;
+
+  if (!countryCode || !mobileNumber || !username || !fullname || !email || !password || !dob || !gender || !instaId || !facebookId) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "Required fields missing",
+    });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedCountryCode = normalizeTrim(countryCode);
+  const normalizedMobileNumber = normalizeTrim(mobileNumber);
+
+  const existingUserQuery = {
+    $or: [
+      { username },
+      { email: normalizedEmail },
+      { countryCode: normalizedCountryCode, mobileNumber: normalizedMobileNumber }
+    ],
+    status: { $ne: "deleted" }
+  };
+
+  const existingUser = await user.findOne(existingUserQuery);
+
+  if (existingUser) {
+    if (existingUser.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+
+    let conflictField = "";
+    if (existingUser.username === username) {
+      conflictField = "Username";
+    } else if ((existingUser.email || "").toLowerCase() === normalizedEmail) {
+      conflictField = "Email";
+    } else {
+      conflictField = "Mobile number";
+    }
+
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: `${conflictField} already exists`
+    });
+  }
+
+  // Username check (ignore deleted users)
+  const usernameTaken = await user.findOne({
+    username,
+    status: { $ne: "deleted" }
+  });
+  if (usernameTaken) {
+    if (usernameTaken.status === "blocked") {
+      return responseHandler({
+        res,
+        code: statusCode.FORBIDDEN,
+        message: "Your account has been blocked"
+      });
+    }
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "Username already exists"
+    });
+  }
+  // Create new user always
+  const newShortId = await getNextShortId();
+  const hashedPassword = await bcryptedPasswordFunc(password);
+  const resolvedFullname = normalizeTrim(fullname) || normalizeTrim(username);
+
+  // NEW USER
+  const userData = await user.create({
+    shortId: newShortId,
+    countryCode: normalizedCountryCode,
+    mobileNumber: normalizedMobileNumber,
+    username,
+    fullname: resolvedFullname,
+    email: normalizedEmail,
+    password: hashedPassword,
+    dob,
+    gender,
+    profileImage,
+    roles: ["user"],
+    status: "active",
+    walletBalance: 0,
+    isWelcomeBonusGiven: false
+  });
+
+  await applyWelcomeBonusAndCodes(userData);
+
+  const existingPartnerReq = await PartnerDetails.findOne({
+    userId: userData._id,
+    verificationStatus: "pending",
+  });
+  if (existingPartnerReq) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "You already have a pending partner enrollment request",
+    });
+  }
+
+  let influencerDetail = await InfluencerDetails.findOne({ userId: userData._id });
+
+  if (influencerDetail && influencerDetail.verificationStatus === "approved") {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "Your influencer profile is already approved",
+    });
+  }
+
+  if (!influencerDetail) {
+    influencerDetail = new InfluencerDetails({ userId: userData._id });
+  }
+
+  influencerDetail.instaId = instaId;
+  influencerDetail.facebookId = facebookId;
+  influencerDetail.isVerified = false;
+  influencerDetail.verificationStatus = "pending";
+
+  await influencerDetail.save();
+
+  return responseHandler({
+    res,
+    code: statusCode.CREATED,
+    message: "Influencer account created. Admin will review within 24 hours.",
+    data: {
+      userId: userData._id,
+      influencerId: influencerDetail._id,
+      verificationStatus: influencerDetail.verificationStatus,
+    },
+  });
+});
+exports.registerPartner = catchAsyncError(async (req, res) => {
+  const {
+    partnerCategory,
+    partnerType,
+    username,
+    fullname,
+    email,
+    countryCode,
+    mobileNumber,
+    password,
+    profileImage,
+    dob,
+    gender,
+    state,
+    district,
+    capital,
+    aadharResponse,
+    panNo,
+    panCardName,
+    managerCode,
+    agencyCode
+  } = req.body;
+
+  if (!username || !email || !countryCode || !mobileNumber || !password || !profileImage || !dob || !gender || !panCardName || !panNo || !partnerCategory) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "Required fields missing",
+    });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedCountryCode = normalizeTrim(countryCode);
+  const normalizedMobileNumber = normalizeTrim(mobileNumber);
+
+  const normalizedPartnerCategory = (partnerCategory || "").toString().trim().toLowerCase();
+  if (normalizedPartnerCategory !== "partner") {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "partnerCategory must be 'partner'",
+    });
+  }
+
+  const normalizedPartnerType = partnerType ? partnerType.toString().trim().toLowerCase() : null;
+  if (normalizedPartnerType && !["manager_associate", "agency_associate"].includes(normalizedPartnerType)) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "partnerType must be manager_associate or agency_associate",
+    });
+  }
+
+  if (normalizedPartnerType === "manager_associate" && !managerCode) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "managerCode is required for manager associates",
+    });
+  }
+
+  if (normalizedPartnerType === "agency_associate" && !agencyCode) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "agencyCode is required for agency associates",
+    });
+  }
+
+  const existingUserQuery = {
+    $or: [
+      { username },
+      { email: normalizedEmail },
+      { countryCode: normalizedCountryCode, mobileNumber: normalizedMobileNumber }
+    ],
+    status: { $ne: "deleted" }
+  };
+  const existingUser = await user.findOne(existingUserQuery);
+
+  if (existingUser) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "User already exists",
+    });
+  }
+
+  const newShortId = await getNextShortId();
+  const hashedPassword = await bcryptedPasswordFunc(password);
+  const resolvedFullname = normalizeTrim(fullname) || normalizeTrim(username);
+
+
+  const createdUser = await user.create({
+    shortId: newShortId,
+    username,
+    fullname: resolvedFullname,
+    email: normalizedEmail,
+    countryCode: normalizedCountryCode,
+    mobileNumber: normalizedMobileNumber,
+    password: hashedPassword,
+    profileImage,
+    dob,
+    gender,
+    roles: ["user"],
+    status: "active"
+  });
+
+  // partner registration should NOT receive welcome bonus or general codes here
+  // partner-specific code will be assigned later after admin approval
+
+  // Block if already pending/approved
+  const existingPartner = await PartnerDetails.findOne({
+    userId: createdUser._id,
+    verificationStatus: { $in: ["pending", "approved"] }
+  });
+
+  if (existingPartner) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message:
+        existingPartner.verificationStatus === "approved"
+          ? "Partner already approved"
+          : "Partner request already pending",
+    });
+  }
+
+  // VALIDATE MANAGER / AGENCY CODE
+  let finalManagerCode = null;
+  let finalAgencyCode = null;
+
+  if (normalizedPartnerType === "manager_associate") {
+    const manager = await resolveApprovedPartnerManagerByCode(managerCode);
+
+    if (!manager) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "Invalid managerCode",
+      });
+    }
+    finalManagerCode = manager.partnerCode;
+  }
+
+  if (normalizedPartnerType === "agency_associate") {
+    const agency = await resolveApprovedAgencyManagerByCode(agencyCode);
+
+    if (!agency) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "Invalid agencyCode",
+      });
+    }
+    finalAgencyCode = agency.partnerCode;
+  }
+  // ✅ ALWAYS create new PartnerDetails (no reuse)
+  const partnerDetail = await PartnerDetails.create({
+    userId: createdUser._id,
+    panNo,
+    panCardName,
+    state,
+    district,
+    capital,
+    aadharResponse,
+    partnerCategory: normalizedPartnerCategory,
+    partnerType: normalizedPartnerType,
+    managerCode: finalManagerCode,
+    agencyCode: finalAgencyCode,
+    isVerified: false,
+    verificationStatus: "pending"
+  });
+
+  return responseHandler({
+    res,
+    code: statusCode.CREATED,
+    message: "Partner account created. Admin will review within 24 hours.",
+    data: {
+      userId: createdUser._id,
+      partnerId: partnerDetail._id,
+      verificationStatus: partnerDetail.verificationStatus,
+    },
+  });
+});
+exports.requestPartnerEnrollment = catchAsyncError(async (req, res) => {
+  const userId = req.userId || (req.user && req.user._id);
+  const foundUser = req.user || await user.findById(userId);
+
+  if (!foundUser) {
+    return responseHandler({
+      res,
+      code: statusCode.RESULTNOTFOUND,
+      message: "User not found",
+    });
+  }
+
+  if (Array.isArray(foundUser.roles) && (foundUser.roles.includes("partner") || foundUser.roles.includes("influencer"))) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "You can enroll only one role at a time (partner OR influencer)",
+    });
+  }
+
+  const {
+    state,
+    district,
+    capital,
+    panNo,
+    panCardName,
+    partnerCategory,
+    partnerType,
+    managerCode,
+    agencyCode,
+    aadharResponse
+  } = req.body;
+
+  const resolvedState = state || (location && location.state);
+  const resolvedDistrict = district || (location && location.district);
+  const resolvedCapital = capital || (location && location.capital);
+
+  const normalizedPartnerCategoryRaw = (partnerCategory || "partner").toString().trim().toLowerCase();
+  if (normalizedPartnerCategoryRaw !== "partner") {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "partnerCategory must be partner",
+    });
+  }
+  const normalizedPartnerType = partnerType ? partnerType.toString().trim().toLowerCase() : "";
+  if (!["manager_associate", "agency_associate"].includes(normalizedPartnerType)) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "partnerType must be manager_associate or agency_associate",
+    });
+  }
+  if (!panNo || !panCardName || !resolvedState || !resolvedDistrict || !resolvedCapital) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "panNo, panCardName and state/district/capital are required",
+    });
+  }
+
+  const existingInfluencerReq = await InfluencerDetails.findOne({
+    userId: foundUser._id,
+    verificationStatus: "pending",
+  });
+  if (existingInfluencerReq) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "You already have a pending influencer enrollment request",
+    });
+  }
+
+  let partnerDetail = await PartnerDetails.findOne({ userId: foundUser._id });
+  if (partnerDetail && partnerDetail.verificationStatus === "approved") {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "Your partner profile is already approved",
+    });
+  }
+  if (!partnerDetail) {
+    partnerDetail = new PartnerDetails({ userId: foundUser._id });
+  }
+
+  const normalizedManagerCode = normalizeTrim(managerCode);
+  const normalizedAgencyCode = normalizeTrim(agencyCode);
+
+  let finalManagerCode = null;
+  let finalAgencyCode = null;
+
+  if (normalizedPartnerType === "manager_associate") {
+    if (!normalizedManagerCode) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "managerCode is required for manager associates",
+      });
+    }
+
+    const manager = await resolveApprovedPartnerManagerByCode(normalizedManagerCode);
+    if (!manager) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "Invalid managerCode",
+      });
+    }
+
+    finalManagerCode = manager.partnerCode;
+  }
+
+  if (normalizedPartnerType === "agency_associate") {
+    if (!normalizedAgencyCode) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "agencyCode is required for agency associates",
+      });
+    }
+
+    const agency = await resolveApprovedAgencyManagerByCode(normalizedAgencyCode);
+    if (!agency) {
+      return responseHandler({
+        res,
+        code: statusCode.DATAMISSING,
+        message: "Invalid agencyCode",
+      });
+    }
+
+    finalAgencyCode = agency.partnerCode;
+  }
+
+  partnerDetail.panNo = panNo;
+  partnerDetail.panCardName = panCardName;
+  partnerDetail.aadharResponse = aadharResponse ? aadharResponse.toString() : undefined;
+  partnerDetail.state = resolvedState;
+  partnerDetail.district = resolvedDistrict;
+  partnerDetail.capital = resolvedCapital;
+  partnerDetail.partnerCategory = "partner";
+  partnerDetail.partnerType = normalizedPartnerType;
+  partnerDetail.managerCode = finalManagerCode;
+  partnerDetail.agencyCode = finalAgencyCode;
+  partnerDetail.isVerified = false;
+  partnerDetail.verificationStatus = "pending";
+
+  await partnerDetail.save();
+
+  return responseHandler({
+    res,
+    code: statusCode.SUCCESS,
+    message: "Partner enrollment request submitted. Admin will review within 24 hours.",
+    data: {
+      partnerId: partnerDetail._id,
+      verificationStatus: partnerDetail.verificationStatus,
+    },
+  });
+});
+exports.requestInfluencerEnrollment = catchAsyncError(async (req, res) => {
+  const userId = req.userId || (req.user && req.user._id);
+  const foundUser = req.user || await user.findById(userId);
+
+  if (!foundUser) {
+    return responseHandler({
+      res,
+      code: statusCode.RESULTNOTFOUND,
+      message: "User not found",
+    });
+  }
+
+  if (Array.isArray(foundUser.roles) && (foundUser.roles.includes("partner") || foundUser.roles.includes("influencer"))) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "You can enroll only one role at a time (partner OR influencer)",
+    });
+  }
+
+  const { instaId, facebookId, state, district, capital, location } = req.body;
+  const resolvedState = state || (location && location.state);
+  const resolvedDistrict = district || (location && location.district);
+  const resolvedCapital = capital || (location && location.capital);
+
+  if (!instaId || !facebookId || !resolvedState || !resolvedDistrict || !resolvedCapital) {
+    return responseHandler({
+      res,
+      code: statusCode.DATAMISSING,
+      message: "instaId, facebookId, state/district/capital (or location) are required",
+    });
+  }
+
+  const existingPartnerReq = await PartnerDetails.findOne({
+    userId: foundUser._id,
+    verificationStatus: "pending",
+  });
+  if (existingPartnerReq) {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "You already have a pending partner enrollment request",
+    });
+  }
+
+  let influencerDetail = await InfluencerDetails.findOne({ userId: foundUser._id });
+  if (influencerDetail && influencerDetail.verificationStatus === "approved") {
+    return responseHandler({
+      res,
+      code: statusCode.CONFLICT,
+      message: "Your influencer profile is already approved",
+    });
+  }
+
+  if (!influencerDetail) {
+    influencerDetail = new InfluencerDetails({ userId: foundUser._id });
+  }
+
+  influencerDetail.instaId = instaId;
+  influencerDetail.facebookId = facebookId;
+  influencerDetail.state = resolvedState;
+  influencerDetail.district = resolvedDistrict;
+  influencerDetail.capital = resolvedCapital;
+  influencerDetail.isVerified = false;
+  influencerDetail.verificationStatus = "pending";
+
+  await influencerDetail.save();
+
+  return responseHandler({
+    res,
+    code: statusCode.SUCCESS,
+    message: "Influencer enrollment request submitted. Admin will review within 24 hours.",
+    data: {
+      influencerId: influencerDetail._id,
+      verificationStatus: influencerDetail.verificationStatus,
+    },
+  });
+});
+
+
+
 exports.forgetPassword = catchAsyncError(async (req, res) => {
   const { usernameOrEmail } = req.body;
   if (!usernameOrEmail) {
@@ -294,9 +1073,9 @@ exports.forgetPassword = catchAsyncError(async (req, res) => {
       message: "User not found",
     });
   }
-  // Generate 6 digit OTP and setting expiration (15 minutes)
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  // Generate 4 digit OTP and setting expiration (5 minutes)
+  const otp = Math.floor(1000 + Math.random() * 9000).toString();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
   foundUser.resetPasswordOTP = otp;
   foundUser.resetPasswordExpires = expiresAt;

@@ -5,8 +5,13 @@ const userCtrl = require("../controllers/userController");
 const { userAuth } = require("../middleware/userAuth");
 
 router.post('/sendOtp', userCtrl.sendOtp);
-router.post('/verifyOtpAndRegister', userCtrl.verifyOtpAndRegister);
+router.post('/createAccount', userCtrl.createAccount);
 router.post('/login', userCtrl.login);
+router.post('/login/partner', userCtrl.partnerLogin);
+router.post('/register/influencer', userCtrl.registerInfluencer);
+router.post('/register/partner', userCtrl.registerPartner);
+router.post('/enroll/partner', userAuth, userCtrl.requestPartnerEnrollment);
+router.post('/enroll/influencer', userAuth, userCtrl.requestInfluencerEnrollment);
 router.post('/forgetPassword', userCtrl.forgetPassword);
 router.post('/verifyPasswordResetOTP', userCtrl.verifyPasswordResetOTP);
 router.get('/getprofile', userAuth, userCtrl.getprofile);

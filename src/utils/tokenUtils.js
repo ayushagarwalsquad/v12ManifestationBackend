@@ -19,3 +19,20 @@ exports.generateUserToken = (user) => {
     };
     return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 };
+
+exports.generateManagerToken = (manager) => {
+    const payload = {
+        managerId: manager._id,
+        managerType: manager.managerType,
+        email: manager.email,
+    };
+    return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+};
+
+exports.generateAgencyToken = (agency) => {
+    const payload = {
+        agencyId: agency._id,
+        email: agency.email
+    };
+    return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
+};
